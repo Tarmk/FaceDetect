@@ -1,0 +1,69 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+.python-version
+
+# Packaging / build
+build/
+dist/
+.eggs/
+*.egg-info/
+*.egg
+wheels/
+share/python-wheels/
+
+# Caches & tooling
+.cache/
+.mypy_cache/
+.pytest_cache/
+.tox/
+.nox/
+.coverage*
+.pyre/
+.pytype/
+
+# Logs
+*.log
+
+# IDE/editor
+.vscode/
+.idea/
+*.iml
+
+# Environment files
+.env
+.env.*
+*.env
+
+# Ultralytics/YOLO artifacts
+runs/
+ultralytics*/
+
+# Model weights and large binaries
+*.pt
+*.onnx
+*.engine
+*.tflite
+*.mlmodel
+
+# Data/media
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# Misc
+Thumbs.db 
+.venv/bin/cpuinfo
