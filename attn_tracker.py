@@ -7,6 +7,7 @@ import sys
 import os
 import platform
 from typing import Optional, Tuple
+from collections import deque
 
 import cv2
 import requests
@@ -116,6 +117,10 @@ def parse_args():
     p.add_argument("--center-attentive", dest="CENTER_ATTENTIVE", type=float, default=0.08)
     p.add_argument("--center-tol", dest="CENTER_TOL", type=float, default=0.10)
     p.add_argument("--center-distract", dest="CENTER_DISTRACT", type=float, default=0.15)
+    # Pupil constraints
+    p.add_argument("--pupil-center-tol", dest="PUPIL_CENTER_TOL", type=float, default=0.10)
+    p.add_argument("--pupil-still-max-s", dest="PUPIL_STILL_MAX_S", type=float, default=2.0)
+    p.add_argument("--pupil-still-speed-max", dest="PUPIL_STILL_SPEED_MAX", type=float, default=8.0)
 
     p.add_argument("--face-miss-ms", dest="FACE_MISS_MS", type=int, default=400)
     p.add_argument("--popup-after-s", dest="POPUP_AFTER_S", type=float, default=3.0)
@@ -180,6 +185,9 @@ def main():
     MIN_ASPECT_FOR_OVERRIDE = float(args.MIN_ASPECT_FOR_OVERRIDE)
     YAW_OVERRIDE_MAX = float(args.YAW_OVERRIDE_MAX)
     BACKEND = args.BACKEND
+    PUPIL_CENTER_TOL = float(args.PUPIL_CENTER_TOL)
+    PUPIL_STILL_MAX_S = float(args.PUPIL_STILL_MAX_S)
+    PUPIL_STILL_SPEED_MAX = float(args.PUPIL_STILL_SPEED_MAX)
 
     # Capture
     cap_src = args.src
@@ -252,6 +260,23 @@ def main():
 
     warmup_start = time.time()
     warmup_frames = 0
+    paused = False
+    last_disp_frame = None
+    quit_requested = False
+    # Eyeball tracking trails and speeds
+    left_trail = deque(maxlen=90)
+    right_trail = deque(maxlen=90)
+    eye_speed_l = 0.0
+    eye_speed_r = 0.0
+    # Pupil stillness accumulator
+    pupil_still_time = 0.0
+    # Manual session tracking (start with 's', end with 'e')
+    session_active = False
+    session_elapsed = 0.0
+    session_non_attentive = 0.0
+    last_session_available = False
+    last_session_elapsed = 0.0
+    last_session_non_attentive_pct = 0.0
 
     while True:
         ok, frame = cap.read()
@@ -378,6 +403,9 @@ def main():
                 ema_ly = ema(ema_ly, float(ly), SMOOTHING)
                 ema_ry = ema(ema_ry, float(ry), SMOOTHING)
                 gaze_to_screen = (PX_LEFT <= ema_lx <= PX_RIGHT) and (PX_LEFT <= ema_rx <= PX_RIGHT)
+                # Pupil-center constraint: both eyes must be near the horizontal center of their ROI
+                # We treat center as 0.5 and require |x-0.5| <= PUPIL_CENTER_TOL
+                pupils_centered = (abs(ema_lx - 0.5) <= PUPIL_CENTER_TOL) and (abs(ema_rx - 0.5) <= PUPIL_CENTER_TOL)
                 gaze_down = (ema_ly >= DOWN_PY_MIN) and (ema_ry >= DOWN_PY_MIN)
                 eye_reliable_streak += 1
                 # Compute absolute pupil positions for overlay (EMA-smoothed)
@@ -388,6 +416,17 @@ def main():
                     rpy = eye_top + int(ema_ry * max(1, eye_bottom - eye_top))
                     lpupil_px = (lpx, lpy)
                     rpupil_px = (rpx, rpy)
+                    # Update trails and instantaneous speeds (pixels/sec)
+                    left_trail.append((lpx, lpy, now))
+                    right_trail.append((rpx, rpy, now))
+                    if len(left_trail) >= 2:
+                        (ax, ay, at), (bx, by, bt) = left_trail[-2], left_trail[-1]
+                        dt_eye = max(1e-3, bt - at)
+                        eye_speed_l = ema(eye_speed_l, math.hypot(bx - ax, by - ay) / dt_eye, 0.7)
+                    if len(right_trail) >= 2:
+                        (ax, ay, at), (bx, by, bt) = right_trail[-2], right_trail[-1]
+                        dt_eye = max(1e-3, bt - at)
+                        eye_speed_r = ema(eye_speed_r, math.hypot(bx - ax, by - ay) / dt_eye, 0.7)
                 except Exception:
                     lpupil_px = None
                     rpupil_px = None
@@ -403,6 +442,11 @@ def main():
                         lpx = x + int(ema_lx * max(1, eye_mid - x))
                         lpy = eye_top + int(ema_ly * max(1, eye_bottom - eye_top))
                         lpupil_px = (lpx, lpy)
+                        left_trail.append((lpx, lpy, now))
+                        if len(left_trail) >= 2:
+                            (ax, ay, at), (bx, by, bt) = left_trail[-2], left_trail[-1]
+                            dt_eye = max(1e-3, bt - at)
+                            eye_speed_l = ema(eye_speed_l, math.hypot(bx - ax, by - ay) / dt_eye, 0.7)
                     except Exception:
                         lpupil_px = None
                 elif rxy is not None:
@@ -414,6 +458,11 @@ def main():
                         rpx = eye_mid + int(ema_rx * max(1, (x + w) - eye_mid))
                         rpy = eye_top + int(ema_ry * max(1, eye_bottom - eye_top))
                         rpupil_px = (rpx, rpy)
+                        right_trail.append((rpx, rpy, now))
+                        if len(right_trail) >= 2:
+                            (ax, ay, at), (bx, by, bt) = right_trail[-2], right_trail[-1]
+                            dt_eye = max(1e-3, bt - at)
+                            eye_speed_r = ema(eye_speed_r, math.hypot(bx - ax, by - ay) / dt_eye, 0.7)
                     except Exception:
                         rpupil_px = None
 
@@ -432,22 +481,27 @@ def main():
                 and (abs(ema_center) <= YAW_OVERRIDE_MAX)
             )
 
-            gaze_attentive = override_allowed and ((gaze_to_screen is True) or (gaze_down is True))
+            # Attentive ONLY when eyes are centered on screen AND pupils are near the ROI center
+            # and not excessively still for too long. Looking down is NOT attentive.
+            gaze_attentive = (
+                override_allowed
+                and (gaze_to_screen is True)
+                and pupils_centered
+                and (pupil_still_time < PUPIL_STILL_MAX_S)
+            )
             if gaze_attentive:
                 candidate_state = "ATTENTIVE"
             else:
                 # Spec-aligned fallback when no reliable gaze
-                if gaze_to_screen is False and not (gaze_down is True):
+                if gaze_to_screen is False:
                     candidate_state = "AWAY"
                 elif ema_center < -CENTER_DISTRACT:
                     candidate_state = "LEFT"
                 elif ema_center > +CENTER_DISTRACT:
                     candidate_state = "RIGHT"
                 else:
-                    if abs(ema_center) <= CENTER_ATTENTIVE:
-                        candidate_state = "ATTENTIVE"
-                    else:
-                        candidate_state = "AWAY"
+                    # Without reliable eye gaze, do NOT mark attentive even if yaw is centered
+                    candidate_state = "AWAY"
 
             if away_pitch and not gaze_attentive:
                 candidate_state = "AWAY"
@@ -478,7 +532,7 @@ def main():
         attention_score = 0
         if face_present:
             attention_score += 60
-        if (gaze_to_screen is True) or (gaze_down is True):
+        if (gaze_to_screen is True):
             attention_score += 25
         if stable_state == "ATTENTIVE":
             attention_score += 15
@@ -487,6 +541,18 @@ def main():
         dt = max(0.0, now - prev_time)
         prev_time = now
         frames += 1
+
+        # Update pupil stillness timer
+        if (eye_speed_l <= PUPIL_STILL_SPEED_MAX) and (eye_speed_r <= PUPIL_STILL_SPEED_MAX):
+            pupil_still_time += dt
+        else:
+            pupil_still_time = 0.0
+
+        # Accumulate session times
+        if session_active:
+            session_elapsed += dt
+            if stable_state != "ATTENTIVE":
+                session_non_attentive += dt
 
         if stable_state == "ATTENTIVE":
             attentive_time += dt
@@ -513,6 +579,11 @@ def main():
             "center_offset": round(float(ema_center), 4),
             "state": stable_state,
             "attention_score": attention_score,
+            "lpupil_px": [int(lpupil_px[0]), int(lpupil_px[1])] if lpupil_px is not None else None,
+            "rpupil_px": [int(rpupil_px[0]), int(rpupil_px[1])] if rpupil_px is not None else None,
+            "eye_speed_l_pxps": round(float(eye_speed_l), 2),
+            "eye_speed_r_pxps": round(float(eye_speed_r), 2),
+            "pupil_still_time_s": round(float(pupil_still_time), 2),
         }
         print(json.dumps(per_frame), flush=True)
 
@@ -560,6 +631,29 @@ def main():
             if rpupil_px is not None:
                 draw_pupil_with_arrows(disp, rpupil_px, horiz_bias=ema_rx, vert_bias=ema_ry)
 
+            # Draw eyeball trails
+            def draw_trail(img, trail, base_color):
+                try:
+                    n = len(trail)
+                    if n < 2:
+                        return
+                    for i in range(1, n):
+                        x1, y1, _ = trail[i - 1]
+                        x2, y2, _ = trail[i]
+                        age = i / n
+                        color = (
+                            int(base_color[0] * age),
+                            int(base_color[1] * age),
+                            int(base_color[2] * age),
+                        )
+                        thickness = 2 if i > n * 0.7 else 1
+                        cv2.line(img, (x1, y1), (x2, y2), color, thickness, cv2.LINE_AA)
+                except Exception:
+                    pass
+
+            draw_trail(disp, left_trail, (0, 255, 200))
+            draw_trail(disp, right_trail, (255, 0, 255))
+
             H, W = disp.shape[:2]
             bar_w = int(200 * (attention_score / 100.0))
             cv2.rectangle(disp, (10, H - 20), (10 + 200, H - 10), (60, 60, 60), -1)
@@ -570,23 +664,154 @@ def main():
             attn_percent = 0.0 if elapsed_in_window <= 0 else (100.0 * (attentive_time / elapsed_in_window))
             cv2.putText(disp, f"attn% {attn_percent:.1f}", (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
 
-            status = [f"conf>={current_conf:.2f}"]
-            if gaze_to_screen is True:
-                status.append("gaze:center")
-            elif gaze_down is True:
-                status.append("gaze:down")
-            elif gaze_to_screen is False:
-                status.append("gaze:away")
-            else:
-                status.append("gaze:NA")
-            status.append(f"yaw:{ema_center:+.2f}")
-            aspect_ratio = (w / float(h)) if (bbox is not None and h > 0) else 0.0
-            status.append(f"override:{'on' if (eye_reliable_streak >= EYE_RELIABLE_FRAMES and aspect_ratio >= MIN_ASPECT_FOR_OVERRIDE and abs(ema_center) <= YAW_OVERRIDE_MAX) else 'off'}")
-            cv2.putText(disp, ", ".join(status), (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2, cv2.LINE_AA)
+            # Detailed status block (show all values)
+            status_lines = []
+            # Time/FPS
+            inst_fps = (1.0 / dt) if dt > 1e-6 else 0.0
+            status_lines.append(f"t {t:.2f}s  frames {frames}  fps {inst_fps:.1f}")
+            # State and scores
+            status_lines.append(f"state {stable_state}  attention_score {attention_score}")
+            # Face and bbox
+            status_lines.append(f"face_present {face_present}  bbox {bbox if bbox is not None else last_bbox}")
+            # Gaze and center
+            try:
+                pup_centered = (abs(ema_lx - 0.5) <= PUPIL_CENTER_TOL) and (abs(ema_rx - 0.5) <= PUPIL_CENTER_TOL)
+            except Exception:
+                pup_centered = False
+            status_lines.append(f"gaze_to_screen {gaze_to_screen}  gaze_down {gaze_down}  center {ema_center:+.3f}  pupils_centered {pup_centered}")
+            # Eye EMA
+            status_lines.append(f"L(x,y) ({ema_lx:.3f}, {ema_ly:.3f})  R(x,y) ({ema_rx:.3f}, {ema_ry:.3f})")
+            # Override related
+            curr_w, curr_h = (bbox[2], bbox[3]) if bbox is not None else ((last_bbox[2], last_bbox[3]) if last_bbox is not None else (0, 0))
+            aspect_ratio = (curr_w / float(curr_h)) if (curr_h > 0) else 0.0
+            override_allowed = (
+                (eye_reliable_streak >= EYE_RELIABLE_FRAMES)
+                and (aspect_ratio >= MIN_ASPECT_FOR_OVERRIDE)
+                and (abs(ema_center) <= YAW_OVERRIDE_MAX)
+            )
+            status_lines.append(
+                f"eye_reliable {eye_reliable_streak}  aspect {aspect_ratio:.2f}  override {override_allowed}"
+            )
+            # Timers and breakdown
+            status_lines.append(
+                f"attentive_time {attentive_time:.1f}s  distracted_time {distracted_time:.1f}s  attn% {attn_percent:.1f}%"
+            )
+            status_lines.append(
+                f"breakdown L {breakdown['LEFT']:.1f}s  R {breakdown['RIGHT']:.1f}s  AWAY {breakdown['AWAY']:.1f}s"
+            )
+            # Eye speeds
+            status_lines.append(
+                f"eye_speed L {eye_speed_l:.1f}px/s  R {eye_speed_r:.1f}px/s  still {pupil_still_time:.1f}s"
+            )
+            # Popups and config
+            status_lines.append(
+                f"popups {popups_triggered}  last_popup_t {last_popup_t:.1f}s  cooldown {POPUP_COOLDOWN_S:.1f}s"
+            )
+            status_lines.append(
+                f"conf>={current_conf:.2f}  imgsz {IMGSZ}  device {'auto' if not DEVICE else DEVICE}"
+            )
+            # Render block
+            y0 = 60
+            for i, line in enumerate(status_lines):
+                cv2.putText(
+                    disp,
+                    line,
+                    (10, y0 + i * 18),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (255, 255, 0),
+                    1,
+                    cv2.LINE_AA,
+                )
+            # Session HUD
+            if session_active:
+                sess_non_attn_pct = 0.0 if session_elapsed <= 0 else (100.0 * (session_non_attentive / session_elapsed))
+                cv2.putText(
+                    disp,
+                    f"session: {session_elapsed:.1f}s  non-attn: {sess_non_attn_pct:.1f}%",
+                    (10, H - 60),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (160, 250, 160),
+                    1,
+                    cv2.LINE_AA,
+                )
+            elif last_session_available:
+                cv2.putText(
+                    disp,
+                    f"last session: {last_session_elapsed:.1f}s  non-attn: {last_session_non_attentive_pct:.1f}%",
+                    (10, H - 60),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (180, 220, 255),
+                    1,
+                    cv2.LINE_AA,
+                )
+
+            # Controls hint
+            cv2.putText(
+                disp,
+                "[S]tart  [E]nd  [P]ause/resume  [Q]/[ESC] quit",
+                (10, H - 40),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (200, 255, 200),
+                1,
+                cv2.LINE_AA,
+            )
+
+            # Keep a copy for pause screen
+            last_disp_frame = disp.copy()
 
             cv2.imshow("attention", disp)
-            if (cv2.waitKey(1) & 0xFF) in (27, ord('q')):
+            key = cv2.waitKey(1) & 0xFF
+            if key in (27, ord('q')):
                 break
+            # Session keys
+            if key in (ord('s'), ord('S')):
+                session_active = True
+                session_elapsed = 0.0
+                session_non_attentive = 0.0
+                last_session_available = False
+            if key in (ord('e'), ord('E')):
+                if session_active:
+                    sess_non_attn_pct = 0.0 if session_elapsed <= 0 else (100.0 * (session_non_attentive / session_elapsed))
+                    print(json.dumps({
+                        "type": "session_end",
+                        "session_elapsed_s": round(session_elapsed, 2),
+                        "non_attentive_percent": round(sess_non_attn_pct, 2),
+                    }), flush=True)
+                    last_session_elapsed = session_elapsed
+                    last_session_non_attentive_pct = sess_non_attn_pct
+                    last_session_available = True
+                session_active = False
+            if key in (ord('p'), ord('P'), 32):
+                paused = not paused
+                # Pause loop: keep showing last frame with PAUSED overlay
+                while paused:
+                    if last_disp_frame is not None:
+                        paused_frame = last_disp_frame.copy()
+                        cv2.putText(
+                            paused_frame,
+                            "PAUSED - press [P] to resume",
+                            (10, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.7,
+                            (0, 255, 255),
+                            2,
+                            cv2.LINE_AA,
+                        )
+                        cv2.imshow("attention", paused_frame)
+                    key2 = cv2.waitKey(30) & 0xFF
+                    if key2 in (27, ord('q')):
+                        paused = False
+                        quit_requested = True
+                        break
+                    if key2 in (ord('p'), ord('P'), 32):
+                        paused = False
+                # If quit pressed during pause, break outer loop
+                if quit_requested:
+                    break
 
     elapsed = time.time() - t0
     duration = (min(END_S, elapsed) - START_S) if START_S < END_S else 0.0
