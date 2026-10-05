@@ -104,7 +104,7 @@ def ensure_weights(path: str) -> str:
 def parse_args():
     p = argparse.ArgumentParser(description="Attention Tracking with YOLO (face) + OpenCV")
     p.add_argument("--model", type=str, default=os.path.join("weights", "yolov8n-face-lindevs.pt"), help="Path to a face-capable YOLO checkpoint")
-    p.add_argument("--src", type=int, default=0, help="Camera index or video file path (use integer for camera)")
+    p.add_argument("--src", type=str, default="0", help="Camera index (e.g. 0) or path to a video file")
     p.add_argument("--width", type=int, default=0, help="Capture width (0 to skip)")
     p.add_argument("--height", type=int, default=0, help="Capture height (0 to skip)")
 
@@ -190,7 +190,7 @@ def main():
     PUPIL_STILL_SPEED_MAX = float(args.PUPIL_STILL_SPEED_MAX)
 
     # Capture
-    cap_src = args.src
+    cap_src = int(args.src) if str(args.src).isdigit() else args.src
 
     def backend_flag(name: str):
         name = (name or "").lower()
