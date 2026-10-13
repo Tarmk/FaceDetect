@@ -65,5 +65,4 @@ ultralytics*/
 *.mkv
 
 # Misc
-Thumbs.db 
-.venv/bin/cpuinfo
+Thumbs.db

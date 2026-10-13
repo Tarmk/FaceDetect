@@ -1,0 +1,5 @@
+# Tests only need OpenCV and NumPy (no YOLO / PyTorch).
+opencv-python-headless>=4.7
+numpy>=1.23
+pytest>=8
+ruff>=0.6
